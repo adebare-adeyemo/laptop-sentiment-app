@@ -29,21 +29,28 @@ def main(args):
     text_col, label_col = detect_columns(df)
     df = df.dropna(subset=[text_col, label_col]).copy()
 
+    # Map numeric codes to human labels BEFORE encoding
     mapping = {0: "Negative", 1: "Neutral", 2: "Positive"}
     df[label_col] = df[label_col].replace(mapping)
+
+    # Clean text (+ negation handling)
     df[text_col] = clean_text_series(df[text_col])
 
+    # Encode labels
     le = LabelEncoder()
     y = le.fit_transform(df[label_col].astype(str))
     class_names = le.classes_.tolist()
 
+    # TF-IDF features (unigrams + bigrams)
     tfidf = TfidfVectorizer(stop_words="english", max_features=args.max_features, ngram_range=(1, args.ngram_max))
     X = tfidf.fit_transform(df[text_col].values)
 
+    # Stratified split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, random_state=42, stratify=y)
 
+    # Models (NB tuned to be less biased)
     models = {
-        "NaiveBayes": MultinomialNB(),
+        "NaiveBayes": MultinomialNB(alpha=0.5, fit_prior=False),
         "LogReg": LogisticRegression(max_iter=4000, class_weight="balanced"),
         "LinearSVC": LinearSVC(class_weight="balanced"),
         "MLP": MLPClassifier(hidden_layer_sizes=(256,), max_iter=600, random_state=42)
@@ -53,10 +60,8 @@ def main(args):
     for name, clf in models.items():
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
-
         acc = accuracy_score(y_test, y_pred)
         p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="macro", zero_division=0)
-
         report_text = classification_report(y_test, y_pred, target_names=class_names, zero_division=0)
         cm = confusion_matrix(y_test, y_pred)
 
@@ -65,23 +70,28 @@ def main(args):
             f.write(report_text)
         plot_cm(cm, class_names, f"{name} Confusion Matrix", out_dir / "figures" / f"confusion_{name}.png")
 
-        summary.append({"model": name, "accuracy": round(float(acc),4),
-                        "precision_macro": round(float(p),4),
-                        "recall_macro": round(float(r),4),
-                        "f1_macro": round(float(f1),4)})
+        summary.append({
+            "model": name,
+            "accuracy": round(float(acc),4),
+            "precision_macro": round(float(p),4),
+            "recall_macro": round(float(r),4),
+            "f1_macro": round(float(f1),4)
+        })
 
+    # Persist vectorizer & encoder
     joblib.dump(tfidf, model_dir / "tfidf.joblib")
     joblib.dump(le,    model_dir / "label_encoder.joblib")
 
     with open(rep_dir / "metrics_summary.json","w") as f:
         json.dump(summary, f, indent=2)
 
+    # Accuracy bar
     import matplotlib.pyplot as plt
     labs = [m["model"] for m in summary]; accs = [m["accuracy"]*100 for m in summary]
     plt.figure(figsize=(7,4)); plt.bar(labs, accs); plt.ylabel("Accuracy (%)"); plt.title("Model Accuracy Comparison")
     plt.tight_layout(); plt.savefig(out_dir / "figures" / "accuracy_comparison.png", dpi=200); plt.close()
 
-    print("â Training complete. Classes:", class_names)
+    print("✅ Training complete. Classes:", class_names)
 
 if __name__ == "__main__":
     import argparse
