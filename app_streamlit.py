@@ -27,164 +27,176 @@ except Exception as e:
     st.stop()
 
 # ===============================
-# Helpers
+# Helpers / cue sets
 # ===============================
+def basic_clean(s: str) -> str:
+    return str(s).lower().replace("’", "'").strip()
+
+# Soft cues (for close-call nudges)
 NEG_CUES_BASE = {
     "bad","terrible","awful","hate","regret","waste","slow","buggy","crash",
     "overheat","lag","poor","worse","worst","don_t_like","not_good","not_recommend"
 }
-# NEW: hard-override cues — if any appear, force Negative
+POS_CUES_BASE = {
+    "good","great","love","amazing","excellent","fantastic","awesome",
+    "fast","smooth","recommend","best","like","thanks","thank","thank_you"
+}
+
+# HARD overrides — if any appear, force class regardless of probabilities
 STRONG_NEG_CUES = {"hate","terrible","awful","regret","worst"}
+STRONG_POS_CUES = {"love","amazing","excellent","fantastic","awesome","best","thanks","thank_you"}
 
-def basic_clean(s: str) -> str:
-    return str(s).lower().replace("’", "'").strip()
-
-def predict_with_safety(text: str, close_gap: float, neg_floor: float,
-                        neg_cues: set, strong_neg_cues: set):
+def predict_with_safety(text: str,
+                        close_gap: float,
+                        neg_floor: float,
+                        pos_floor: float,
+                        neg_cues: set,
+                        pos_cues: set,
+                        strong_neg_cues: set,
+                        strong_pos_cues: set):
     """
-    Base prediction + probability-based safety override + HARD override for strong negative cues.
+    Base prediction + (1) HARD overrides for strong cues, then (2) soft, probability-based nudges.
+    Soft rules are symmetric: lean Negative (or Positive) on close calls with cues present.
     """
     X = tfidf.transform([text])
     pred_id = int(clf.predict(X)[0])
     pred_label = CLASS_NAMES[pred_id]
     proba_txt = ""
-
     toks = set(basic_clean(text).split())
 
-    # --- HARD OVERRIDE ---
-    # If any strong negative cue is present, force Negative immediately.
-    if any(tok in toks for tok in strong_neg_cues):
-        try:
-            neg_idx = CLASS_NAMES.index("Negative")
-            pred_label = "Negative"
-            pred_id = neg_idx
-            # still show probabilities if available
-            if hasattr(clf, "predict_proba"):
-                probs = clf.predict_proba(X)[0]
-                proba_txt = "  |  " + ", ".join(
-                    [f"{lbl}: {p:.2f}" for lbl, p in zip(CLASS_NAMES, probs)]
-                )
-            return pred_label, pred_id, proba_txt
-        except ValueError:
-            pass  # fall back if "Negative" not in classes
+    # ---------- HARD OVERRIDES ----------
+    try:
+        neg_idx = CLASS_NAMES.index("Negative")
+        pos_idx = CLASS_NAMES.index("Positive")
+    except ValueError:
+        neg_idx = pos_idx = None
 
-    # --- Soft (probability-based) rule ---
-    if hasattr(clf, "predict_proba"):
+    # 1) If strong neg cue present, force Negative
+    if neg_idx is not None and any(tok in toks for tok in strong_neg_cues):
+        pred_label, pred_id = "Negative", neg_idx
+        if hasattr(clf, "predict_proba"):
+            p = clf.predict_proba(X)[0]
+            proba_txt = "  |  " + ", ".join([f"{lbl}: {v:.2f}" for lbl, v in zip(CLASS_NAMES, p)])
+        return pred_label, pred_id, proba_txt
+
+    # 2) If strong pos cue present (AND no strong neg), force Positive
+    if pos_idx is not None and any(tok in toks for tok in strong_pos_cues):
+        pred_label, pred_id = "Positive", pos_idx
+        if hasattr(clf, "predict_proba"):
+            p = clf.predict_proba(X)[0]
+            proba_txt = "  |  " + ", ".join([f"{lbl}: {v:.2f}" for lbl, v in zip(CLASS_NAMES, p)])
+        return pred_label, pred_id, proba_txt
+
+    # ---------- SOFT RULES (probability-based) ----------
+    if hasattr(clf, "predict_proba") and (neg_idx is not None) and (pos_idx is not None):
         probs = clf.predict_proba(X)[0]
-        proba_txt = "  |  " + ", ".join(
-            [f"{lbl}: {p:.2f}" for lbl, p in zip(CLASS_NAMES, probs)]
-        )
-        try:
-            neg_idx = CLASS_NAMES.index("Negative")
-            pos_idx = CLASS_NAMES.index("Positive")
-            neg_prob = float(probs[neg_idx])
-            pos_prob = float(probs[pos_idx])
-            has_neg = any(tok in toks for tok in neg_cues)
+        proba_txt = "  |  " + ", ".join([f"{lbl}: {p:.2f}" for lbl, p in zip(CLASS_NAMES, probs)])
 
-            # If clear negative cues & close call, lean Negative
-            if has_neg and (abs(pos_prob - neg_prob) < close_gap) and (neg_prob >= neg_floor):
-                pred_label = "Negative"
-                pred_id = neg_idx
-        except Exception:
-            pass
+        neg_prob = float(probs[neg_idx])
+        pos_prob = float(probs[pos_idx])
+        gap = abs(pos_prob - neg_prob)
+
+        has_neg = any(tok in toks for tok in neg_cues)
+        has_pos = any(tok in toks for tok in pos_cues)
+
+        # Lean Negative on close-call negatives
+        if has_neg and (gap < close_gap) and (neg_prob >= neg_floor):
+            pred_label, pred_id = "Negative", neg_idx
+
+        # Lean Positive on close-call positives (only if we didn't already flip to Negative)
+        elif has_pos and (gap < close_gap) and (pos_prob >= pos_floor):
+            pred_label, pred_id = "Positive", pos_idx
 
     return pred_label, pred_id, proba_txt
-
-def evaluate_thresholds(df: pd.DataFrame, close_gap_vals, neg_floor_vals, neg_cues: set):
-    """Grid-search thresholds to maximize F1 for the Negative class."""
-    if not hasattr(clf, "predict_proba"):
-        st.warning("This model has no probabilities (predict_proba). Auto-tune disabled.")
-        return None, None, None
-
-    X_all = tfidf.transform(df["text"].astype(str).tolist())
-    probs_all = clf.predict_proba(X_all)
-    label_to_idx = {lbl: i for i, lbl in enumerate(CLASS_NAMES)}
-    y_true = np.array([label_to_idx.get(y, -1) for y in df["label"].astype(str)])
-    neg_idx = label_to_idx.get("Negative", None)
-    pos_idx = label_to_idx.get("Positive", None)
-    if neg_idx is None or pos_idx is None:
-        st.error("Labels must include 'Negative' and 'Positive' for auto-tune.")
-        return None, None, None
-
-    tokens = [set(basic_clean(t).split()) for t in df["text"]]
-    has_neg_cue = np.array([any(tok in neg_cues for tok in toks) for toks in tokens])
-
-    best_f1_neg = -1.0
-    best_gap, best_floor = None, None
-
-    for gap in close_gap_vals:
-        for floor in neg_floor_vals:
-            preds = []
-            for i in range(len(df)):
-                p = probs_all[i]
-                base = int(np.argmax(p))
-                pred = base
-                if has_neg_cue[i] and abs(p[pos_idx] - p[neg_idx]) < gap and p[neg_idx] >= floor:
-                    pred = neg_idx
-                preds.append(pred)
-
-            preds = np.array(preds)
-            tp = np.sum((preds == neg_idx) & (y_true == neg_idx))
-            fp = np.sum((preds == neg_idx) & (y_true != neg_idx))
-            fn = np.sum((preds != neg_idx) & (y_true == neg_idx))
-            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1   = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
-
-            if f1 > best_f1_neg:
-                best_f1_neg = f1
-                best_gap, best_floor = gap, floor
-
-    return best_gap, best_floor, best_f1_neg
 
 # ===============================
 # Sidebar — Auto-Tune (optional)
 # ===============================
 st.sidebar.header("⚙️ Auto-Tune thresholds (optional)")
-st.sidebar.caption("Upload a small labeled CSV to learn best thresholds for the soft safety rule.")
-cal_csv = st.sidebar.file_uploader("CSV with columns: text, label", type=["csv"], key="cal_csv")
+st.sidebar.caption("Upload a small labeled CSV (columns: text, label) to tune the soft rule.\n"
+                   "Hard overrides always apply for strong cues.")
 
 DEFAULT_CLOSE_GAP = 0.15
 DEFAULT_NEG_FLOOR = 0.30
+DEFAULT_POS_FLOOR = 0.30
 
-if "close_gap" not in st.session_state:
-    st.session_state.close_gap = DEFAULT_CLOSE_GAP
-if "neg_floor" not in st.session_state:
-    st.session_state.neg_floor = DEFAULT_NEG_FLOOR
+if "close_gap" not in st.session_state: st.session_state.close_gap = DEFAULT_CLOSE_GAP
+if "neg_floor" not in st.session_state: st.session_state.neg_floor = DEFAULT_NEG_FLOOR
+if "pos_floor" not in st.session_state: st.session_state.pos_floor = DEFAULT_POS_FLOOR
 
-if cal_csv is not None:
+cal_csv = st.sidebar.file_uploader("CSV with columns: text, label", type=["csv"], key="cal_csv")
+if cal_csv is not None and hasattr(clf, "predict_proba"):
     try:
         df_cal = pd.read_csv(cal_csv)
-        if not {"text", "label"}.issubset(set(df_cal.columns)):
+        if not {"text","label"}.issubset(df_cal.columns):
             st.sidebar.error("CSV must have 'text' and 'label' columns.")
         else:
-            gaps = np.arange(0.05, 0.31, 0.05)
-            floors = np.arange(0.20, 0.61, 0.05)
-            gap, floor, f1neg = evaluate_thresholds(df_cal, gaps, floors, NEG_CUES_BASE)
-            if gap is not None:
-                st.session_state.close_gap = float(gap)
-                st.session_state.neg_floor = float(floor)
-                st.sidebar.success(
-                    f"Tuned ✅  CLOSE_GAP={gap:.2f}, NEG_FLOOR={floor:.2f} | F1(Neg)≈{f1neg:.3f}"
-                )
-            else:
-                st.sidebar.warning("Auto-tune could not determine thresholds.")
+            Xc = tfidf.transform(df_cal["text"].astype(str))
+            Pc = clf.predict_proba(Xc)
+            label_to_idx = {lbl:i for i,lbl in enumerate(CLASS_NAMES)}
+            if "Negative" in label_to_idx and "Positive" in label_to_idx:
+                neg_i, pos_i = label_to_idx["Negative"], label_to_idx["Positive"]
+                toks = [set(basic_clean(t).split()) for t in df_cal["text"]]
+                has_neg = np.array([any(x in NEG_CUES_BASE for x in tk) for tk in toks])
+                has_pos = np.array([any(x in POS_CUES_BASE for x in tk) for tk in toks])
+                y_true = np.array([label_to_idx.get(y, -1) for y in df_cal["label"].astype(str)])
+
+                def f1_for(gap, nfloor, pfloor):
+                    preds = []
+                    for i in range(len(df_cal)):
+                        p = Pc[i]; base = int(np.argmax(p)); pred = base
+                        gap_i = abs(p[pos_i]-p[neg_i])
+                        if has_neg[i] and (gap_i < gap) and (p[neg_i] >= nfloor):
+                            pred = neg_i
+                        elif has_pos[i] and (gap_i < gap) and (p[pos_i] >= pfloor):
+                            pred = pos_i
+                        preds.append(pred)
+                    preds = np.array(preds)
+
+                    # F1 for both classes (macro of Pos/Neg only)
+                    def f1_for_class(c):
+                        tp = np.sum((preds==c)&(y_true==c))
+                        fp = np.sum((preds==c)&(y_true!=c))
+                        fn = np.sum((preds!=c)&(y_true==c))
+                        prec = tp/(tp+fp) if (tp+fp)>0 else 0.0
+                        rec  = tp/(tp+fn) if (tp+fn)>0 else 0.0
+                        return (2*prec*rec)/(prec+rec) if (prec+rec)>0 else 0.0
+                    return (f1_for_class(neg_i)+f1_for_class(pos_i))/2.0
+
+                gaps   = np.arange(0.05, 0.31, 0.05)
+                nfloors= np.arange(0.20, 0.61, 0.05)
+                pfloors= np.arange(0.20, 0.61, 0.05)
+
+                best=(None, None, None); best_score=-1.0
+                for g in gaps:
+                    for nf in nfloors:
+                        for pf in pfloors:
+                            score = f1_for(g, nf, pf)
+                            if score>best_score:
+                                best=(g,nf,pf); best_score=score
+
+                if best[0] is not None:
+                    st.session_state.close_gap = float(best[0])
+                    st.session_state.neg_floor = float(best[1])
+                    st.session_state.pos_floor = float(best[2])
+                    st.sidebar.success(
+                        f"Tuned ✅ CLOSE_GAP={best[0]:.2f} | NEG_FLOOR={best[1]:.2f} | "
+                        f"POS_FLOOR={best[2]:.2f} | Macro F1(Neg/Pos)≈{best_score:.3f}"
+                    )
     except Exception as e:
         st.sidebar.error(f"Auto-tune error: {e}")
 
+# Manual sliders
 st.sidebar.markdown("### Thresholds (soft rule)")
-st.session_state.close_gap = st.sidebar.slider(
-    "CLOSE_GAP (closeness of Pos vs Neg)", 0.01, 0.50, float(st.session_state.close_gap), 0.01
-)
-st.session_state.neg_floor = st.sidebar.slider(
-    "NEG_FLOOR (min Negative probability)", 0.10, 0.80, float(st.session_state.neg_floor), 0.01
-)
+st.session_state.close_gap = st.sidebar.slider("CLOSE_GAP (|Pos−Neg|)", 0.01, 0.50, float(st.session_state.close_gap), 0.01)
+st.session_state.neg_floor = st.sidebar.slider("NEG_FLOOR (min P(Neg))", 0.10, 0.80, float(st.session_state.neg_floor), 0.01)
+st.session_state.pos_floor = st.sidebar.slider("POS_FLOOR (min P(Pos))", 0.10, 0.80, float(st.session_state.pos_floor), 0.01)
 
 # ===============================
 # Main — Single prediction
 # ===============================
 st.subheader("🔎 Single Review")
-sample = "Battery life is bad; I hate this laptop."
+sample = "Thank you for the laptop — it is amazing!"
 text = st.text_area("Enter a laptop review", sample, height=120)
 
 if st.button("Predict sentiment"):
@@ -192,8 +204,11 @@ if st.button("Predict sentiment"):
         text=text,
         close_gap=st.session_state.close_gap,
         neg_floor=st.session_state.neg_floor,
+        pos_floor=st.session_state.pos_floor,
         neg_cues=NEG_CUES_BASE,
+        pos_cues=POS_CUES_BASE,
         strong_neg_cues=STRONG_NEG_CUES,
+        strong_pos_cues=STRONG_POS_CUES,
     )
     st.success(f"Prediction: **{label}** (id={pid}){proba_txt}")
     st.caption(f"Class order: {CLASS_NAMES}")
@@ -223,8 +238,11 @@ if csv is not None:
                 text=t,
                 close_gap=st.session_state.close_gap,
                 neg_floor=st.session_state.neg_floor,
+                pos_floor=st.session_state.pos_floor,
                 neg_cues=NEG_CUES_BASE,
+                pos_cues=POS_CUES_BASE,
                 strong_neg_cues=STRONG_NEG_CUES,
+                strong_pos_cues=STRONG_POS_CUES,
             )
             labels.append(lbl); ids.append(pid)
         out["pred_id"] = ids
