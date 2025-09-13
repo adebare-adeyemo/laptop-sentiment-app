@@ -9,8 +9,8 @@ from pathlib import Path
 # ===============================
 MODEL_DIR = Path("models/classical")
 
-st.set_page_config(page_title="Laptop Sentiment — Quick Predict", layout="wide")
-st.title("💻 Laptop Sentiment — Quick Predict")
+st.set_page_config(page_title="Laptop Sentiment", layout="wide")
+st.title("💻 Laptop Sentiment Predict")
 
 try:
     tfidf = joblib.load(MODEL_DIR / "tfidf.joblib")
