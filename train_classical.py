@@ -1,53 +1,52 @@
 """
-Balanced classical sentiment training that outputs the three artifacts your
-predict-only app needs:
+Fast classical fix + keyword boosting:
+- LogisticRegression (probabilities + thresholding)
+- Negation-aware cleaning ("don't like" -> "don_t_like")
+- Class-balanced oversampling on TRAIN split
+- TF-IDF (1–3 grams, up to 20k features)
+- Keyword boosting: repeats severe negative tokens so TF-IDF learns them
+
+Outputs (for app_predict_only.py):
   models/classical/tfidf.joblib
   models/classical/label_encoder.joblib
   models/classical/best.joblib
-
-What’s improved:
-- Negation-aware cleaning (don’t like -> don_t_like, not good -> not_good)
-- Stratified split (no leakage)
-- Class-balanced training (oversample minority classes only on TRAIN)
-- Stronger TF-IDF features (1–3 grams, up to 30k features)
-- Compares LinearSVC and LogisticRegression; picks best by macro-F1
 """
 
 from pathlib import Path
-import json
 import numpy as np
 import pandas as pd
 import joblib
 from collections import Counter
-
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import classification_report, f1_score, confusion_matrix, accuracy_score
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
+from sklearn.metrics import f1_score, accuracy_score, classification_report
 from scipy.sparse import vstack as sp_vstack
 
-# -------------------- config --------------------
-DATA = "data/Labeled_Laptop_Reviews.csv"     # <-- adjust if needed
-OUT = Path("models/classical")               # artifacts go here
-OUT_FIG = Path("outputs/figures")            # optional plots
-OUT_REP = Path("outputs/reports")            # txt/json reports
-MAX_FEAT = 30000
-NGRAM_MAX = 3
+# ---------- Config ----------
+DATA = "data/Labeled_Laptop_Reviews.csv"  # change if needed
+OUT_DIR = Path("models/classical")
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
+MAX_FEATURES = 20000
+NGRAM_MAX = 3
 
-OUT.mkdir(parents=True, exist_ok=True)
-OUT_FIG.mkdir(parents=True, exist_ok=True)
-OUT_REP.mkdir(parents=True, exist_ok=True)
+# Keyword boosting (repeat tokens to increase TF-IDF weight)
+NEG_KEYWORDS = {
+    "bad","terrible","awful","hate","regret","waste","slow","buggy","crash",
+    "overheat","lag","poor","worse","worst","don_t_like","not_good","not_recommend",
+}
+BOOST_FACTOR = 3  # each matched token is repeated (original + 3x)
 
-# -------------------- helpers --------------------
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------- Helpers ----------
 def clean_text(s: str) -> str:
     s = str(s).lower().replace("’","'").strip()
     toks = s.split()
-    neg = {"not","no","never","cant","can't","dont","don't","isnt","isn't","doesnt",
-           "doesn't","didnt","didn't","won't","wont","wasn't","wasnt"}
+    neg = {"not","no","never","cant","can't","dont","don't","isnt","isn't","doesnt","doesn't",
+           "didnt","didn't","won't","wont","wasn't","wasnt"}
     out=[]; i=0
     while i < len(toks):
         if toks[i] in neg and i+1 < len(toks):
@@ -57,18 +56,19 @@ def clean_text(s: str) -> str:
     return " ".join(out)
 
 def detect_cols(df: pd.DataFrame):
-    text_cands = ["Review","Text","Sentence","comment","review_text","content","body"]
-    label_cands = ["Sentiment","label","target","VADER_Sentiment","sentiment"]
-    text = next((c for c in text_cands if c in df.columns), None)
-    if text is None:
-        objs = df.select_dtypes(include="object").columns.tolist()
-        if not objs: raise ValueError("No text column found")
-        text = objs[0]
-    label = next((c for c in label_cands if c in df.columns), None)
-    if label is None: raise ValueError("No label column found")
-    return text, label
+    text_candidates = ["Review","Text","Sentence","comment","review_text","content","body"]
+    label_candidates = ["Sentiment","label","target","VADER_Sentiment","sentiment"]
+    text_col = next((c for c in text_candidates if c in df.columns), None)
+    if text_col is None:
+        obj = df.select_dtypes(include="object").columns.tolist()
+        if not obj: raise ValueError("No text column found")
+        text_col = obj[0]
+    label_col = next((c for c in label_candidates if c in df.columns), None)
+    if label_col is None:
+        raise ValueError("No label column found")
+    return text_col, label_col
 
-def balance_train(X_tr, y_tr):
+def oversample_train(X_tr, y_tr):
     counts = Counter(y_tr); maxc = max(counts.values())
     idx_by = {c: np.where(y_tr==c)[0] for c in counts}
     parts_X, parts_y = [], []
@@ -82,61 +82,55 @@ def balance_train(X_tr, y_tr):
     perm = np.random.permutation(Xb.shape[0])
     return Xb[perm], yb[perm]
 
-# -------------------- load & prep --------------------
+def boost_keywords(doc: str) -> str:
+    """Repeat NEG_KEYWORDS in the doc to boost their TF-IDF weights."""
+    toks = doc.split()
+    extra = []
+    for t in toks:
+        if t in NEG_KEYWORDS:
+            extra.extend([t] * BOOST_FACTOR)
+    return " ".join(toks + extra)  # original + boosted copies
+
+# ---------- Load & prep ----------
 df = pd.read_csv(DATA)
 text_col, label_col = detect_cols(df)
+
+# Map numeric labels if present
 df[label_col] = df[label_col].replace({0:"Negative",1:"Neutral",2:"Positive"})
-df[text_col] = df[text_col].astype(str).apply(clean_text)
+
+# Clean + Boost
+df[text_col] = df[text_col].astype(str).apply(clean_text).apply(boost_keywords)
 df = df.dropna(subset=[text_col, label_col]).copy()
 
+# Encode labels
 le = LabelEncoder()
 y = le.fit_transform(df[label_col].astype(str))
-classes = le.classes_.tolist()
 
-tfidf = TfidfVectorizer(stop_words="english", max_features=MAX_FEAT, ngram_range=(1, NGRAM_MAX))
+# Features
+tfidf = TfidfVectorizer(stop_words="english", max_features=MAX_FEATURES, ngram_range=(1, NGRAM_MAX))
 X = tfidf.fit_transform(df[text_col].values)
 
-X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=TEST_SIZE,
-                                          random_state=RANDOM_STATE, stratify=y)
+# Split
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y)
 
-# balance only the training split
-X_tr_bal, y_tr_bal = balance_train(X_tr, y_tr)
+# Balance training split only
+X_tr_bal, y_tr_bal = oversample_train(X_tr, y_tr)
 
-# -------------------- train models --------------------
-models = {
-    "LinearSVC": LinearSVC(class_weight="balanced"),
-    "LogReg":    LogisticRegression(max_iter=4000, class_weight="balanced"),
-}
+# ---------- Train Logistic Regression ----------
+clf = LogisticRegression(max_iter=4000, class_weight="balanced")
+clf.fit(X_tr_bal, y_tr_bal)
 
-metrics = []
-trained = {}
-for name, clf in models.items():
-    clf.fit(X_tr_bal, y_tr_bal)
-    pred = clf.predict(X_te)
-    f1 = f1_score(y_te, pred, average="macro")
-    acc = accuracy_score(y_te, pred)
-    rep = classification_report(y_te, pred, target_names=classes, zero_division=0)
-    cm  = confusion_matrix(y_te, pred)
+# Evaluate
+pred = clf.predict(X_te)
+f1 = f1_score(y_te, pred, average="macro")
+acc = accuracy_score(y_te, pred)
+print(f"Macro-F1: {f1:.4f} | Accuracy: {acc:.4f}")
+print("\nClassification report:")
+print(classification_report(y_te, pred, target_names=le.classes_.tolist(), zero_division=0))
 
-    trained[name] = clf
-    metrics.append({"model": name, "f1_macro": float(f1), "accuracy": float(acc)})
+# ---------- Save artifacts ----------
+joblib.dump(tfidf, OUT_DIR / "tfidf.joblib")
+joblib.dump(le,    OUT_DIR / "label_encoder.joblib")
+joblib.dump(clf,   OUT_DIR / "best.joblib")
 
-    # save per-model report
-    (OUT_REP / f"{name}_report.txt").write_text(rep)
-
-# pick best by macro-F1
-metrics = sorted(metrics, key=lambda m: m["f1_macro"], reverse=True)
-best_name = metrics[0]["model"]
-best_clf  = trained[best_name]
-
-# -------------------- save artifacts --------------------
-joblib.dump(tfidf, OUT / "tfidf.joblib")
-joblib.dump(le,    OUT / "label_encoder.joblib")
-joblib.dump(best_clf, OUT / "best.joblib")
-
-# also record a JSON summary (nice to keep)
-(Path(OUT_REP) / "metrics_summary.json").write_text(json.dumps(metrics, indent=2))
-
-print("✅ Done.")
-print("Saved artifacts in:", OUT.resolve())
-print("Best model:", best_name, " | F1_macro:", round(metrics[0]["f1_macro"], 4))
+print("\nSaved: models/classical/{tfidf.joblib,label_encoder.joblib,best.joblib}")
