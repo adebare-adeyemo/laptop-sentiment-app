@@ -1,0 +1,4 @@
+import joblib
+
+# Assume you trained `mlp_model`
+joblib.dump(mlp_model, "models/classical/best.joblib")
