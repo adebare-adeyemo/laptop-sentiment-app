@@ -17,7 +17,7 @@ try:
     le    = joblib.load(MODEL_DIR / "label_encoder.joblib")
     clf   = joblib.load(MODEL_DIR / "best.joblib")
     CLASS_NAMES = list(le.classes_)
-    st.sidebar.success(f"Artifacts loaded ✓ | classes: {CLASS_NAMES}")
+    st.sidebar.success("Artifacts loaded ✓")
 except Exception as e:
     st.sidebar.error(
         "Could not load artifacts from models/classical/.\n\n"
@@ -27,21 +27,25 @@ except Exception as e:
     st.stop()
 
 # ===============================
-# Cue sets
+# Cue sets & helpers
 # ===============================
 def basic_clean(s: str) -> str:
     return str(s).lower().replace("’", "'").strip()
 
-NEG_CUES_BASE = {"bad","terrible","awful","hate","regret","waste","slow","buggy","crash",
-                 "overheat","lag","poor","worse","worst","don_t_like","not_good","not_recommend"}
-POS_CUES_BASE = {"good","great","love","amazing","excellent","fantastic","awesome",
-                 "fast","smooth","recommend","best","like","thanks","thank","thank_you"}
-
+NEG_CUES_BASE = {
+    "bad","terrible","awful","hate","regret","waste","slow","buggy","crash",
+    "overheat","lag","poor","worse","worst","don_t_like","not_good","not_recommend"
+}
+POS_CUES_BASE = {
+    "good","great","love","amazing","excellent","fantastic","awesome",
+    "fast","smooth","recommend","best","like","thanks","thank","thank_you"
+}
+# Hard override cues
 STRONG_NEG_CUES = {"hate","terrible","awful","regret","worst"}
 STRONG_POS_CUES = {"love","amazing","excellent","fantastic","awesome","best","thanks","thank_you"}
 
 # ===============================
-# Prediction logic
+# Prediction logic (no probabilities shown)
 # ===============================
 def predict_label(text: str,
                   close_gap: float,
@@ -62,13 +66,13 @@ def predict_label(text: str,
     except ValueError:
         neg_idx = pos_idx = None
 
-    # Hard overrides
+    # --- HARD OVERRIDES ---
     if neg_idx is not None and any(tok in toks for tok in strong_neg_cues):
         return "Negative", neg_idx
     if pos_idx is not None and any(tok in toks for tok in strong_pos_cues):
         return "Positive", pos_idx
 
-    # Soft rules if predict_proba available
+    # --- SOFT RULES (if model supports predict_proba) ---
     if hasattr(clf, "predict_proba") and neg_idx is not None and pos_idx is not None:
         probs = clf.predict_proba(X)[0]
         neg_prob, pos_prob = float(probs[neg_idx]), float(probs[pos_idx])
@@ -84,9 +88,10 @@ def predict_label(text: str,
     return pred_label, pred_id
 
 # ===============================
-# Sidebar threshold controls
+# Sidebar — fixed but tweakable thresholds
+# (remove this block if you want them hard-coded)
 # ===============================
-st.sidebar.header("⚙️ Thresholds (soft rule)")
+st.sidebar.header("⚙️ Soft-rule thresholds")
 if "close_gap" not in st.session_state: st.session_state.close_gap = 0.15
 if "neg_floor" not in st.session_state: st.session_state.neg_floor = 0.30
 if "pos_floor" not in st.session_state: st.session_state.pos_floor = 0.30
@@ -96,14 +101,14 @@ st.session_state.neg_floor = st.sidebar.slider("NEG_FLOOR", 0.10, 0.80, float(st
 st.session_state.pos_floor = st.sidebar.slider("POS_FLOOR", 0.10, 0.80, float(st.session_state.pos_floor), 0.01)
 
 # ===============================
-# Main — Single prediction
+# Single prediction (no probabilities shown)
 # ===============================
 st.subheader("🔎 Single Review")
 sample = "Thank you for the laptop — it is amazing!"
 text = st.text_area("Enter a laptop review", sample, height=120)
 
 if st.button("Predict sentiment"):
-    label, pid = predict_label(
+    label, _ = predict_label(
         text=text,
         close_gap=st.session_state.close_gap,
         neg_floor=st.session_state.neg_floor,
@@ -114,3 +119,51 @@ if st.button("Predict sentiment"):
         strong_pos_cues=STRONG_POS_CUES,
     )
     st.success(f"Prediction: **{label}**")
+
+# ===============================
+# Batch CSV prediction (no probabilities shown)
+# ===============================
+st.subheader("📦 Batch Predict (CSV)")
+st.caption("Upload a CSV. I’ll detect a text column and add a **pred_label** column.")
+
+csv = st.file_uploader("Upload CSV", type=["csv"])
+if csv is not None:
+    try:
+        df = pd.read_csv(csv)
+
+        # Heuristically pick a text column
+        preferred = ["Review","Text","Sentence","comment","review_text","content","body","text"]
+        text_col = next((c for c in preferred if c in df.columns), None)
+        if text_col is None:
+            obj_cols = df.select_dtypes(include="object").columns.tolist()
+            text_col = obj_cols[0] if obj_cols else None
+
+        if text_col is None:
+            st.error("Could not find a text column in this CSV.")
+        else:
+            # Predict each row
+            labels = []
+            for t in df[text_col].astype(str).fillna(""):
+                lbl, _ = predict_label(
+                    text=t,
+                    close_gap=st.session_state.close_gap,
+                    neg_floor=st.session_state.neg_floor,
+                    pos_floor=st.session_state.pos_floor,
+                    neg_cues=NEG_CUES_BASE,
+                    pos_cues=POS_CUES_BASE,
+                    strong_neg_cues=STRONG_NEG_CUES,
+                    strong_pos_cues=STRONG_POS_CUES,
+                )
+                labels.append(lbl)
+
+            out = df.copy()
+            out["pred_label"] = labels
+            st.dataframe(out.head(30), use_container_width=True)
+            st.download_button(
+                "⬇️ Download predictions",
+                data=out.to_csv(index=False),
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
+    except Exception as e:
+        st.error(f"Failed to process CSV: {e}")
