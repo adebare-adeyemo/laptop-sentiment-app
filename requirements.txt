@@ -1,9 +1,16 @@
-streamlit
-pandas
-scikit-learn
-joblib
-matplotlib
-seaborn
-plotly
-transformers
-torch
+# Core
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.24
+
+# ML / Training
+scikit-learn>=1.3
+joblib>=1.3
+
+# Visualizations (used in training & evaluation apps)
+matplotlib>=3.7
+seaborn>=0.12
+
+# Optional: for BERT / Hugging Face
+transformers>=4.40
+torch>=2.2
